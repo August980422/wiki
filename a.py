@@ -1,5 +1,6 @@
 import requests
 import re
+import time
 
 API_URL = "https://zh.wikipedia.org/w/api.php"
 
@@ -8,10 +9,10 @@ USERNAME = ""
 PASSWORD = ""
 
 HEADERS = {
-    "User-Agent": "OnlyStubBot/1.0 (https://zh.wikipedia.org/; YourBotUsername)"
+    "User-Agent": "OnlyStubBot/2.0 (https://zh.wikipedia.org/; YourBotUsername)"
 }
 
-# 常見消歧義模板清單（可依需要擴充）
+# 常見消歧義模板清單
 DISAMBIG_TEMPLATES = [
     '{{disambig',
     '{{Disambiguation',
@@ -87,7 +88,7 @@ def remove_some_markup(text: str) -> str:
 def count_effective_length(text: str) -> float:
     """
     根據需求：
-      - 中文 / 中文標點 => +1
+      - 中文 / 中標點 => +1
       - 單個英數 => +0.5
       - 外文單詞(≥2字母連續英文) => +2
       - 其餘符號 => +1
@@ -119,7 +120,7 @@ def count_effective_length(text: str) -> float:
             total_score += 0.5 * len(token)
             continue
         
-        # 英數混合(≥2字) => 當外文單詞 => +2
+        # 英數混合(≥2字) => 視為外文單詞 => +2
         if re.match(r'^[A-Za-z0-9]+$', token):
             if len(token) >= 2:
                 total_score += 2.0
@@ -173,86 +174,104 @@ def main():
     # 2) 取得 CSRF token
     csrf_token = get_csrf_token(S)
     
-    # 3) 取得前 10 筆非重定向條目
-    params_allpages = {
-        'action': 'query',
-        'list': 'allpages',
-        'apnamespace': '0',             # 條目名字空間
-        'apfilterredir': 'nonredirects',# 排除重定向
-        'aplimit': '100',
-        'format': 'json'
-    }
-    r_allpages = S.get(API_URL, params=params_allpages, headers=HEADERS)
-    data_ap = r_allpages.json()
+    # 3) 分批遍歷 allpages，直到無更多頁面可繼續
+    apcontinue = None
+    ap_limit = 50  # 每次抓取的頁數，可依需求調整
     
-    pages = data_ap.get('query', {}).get('allpages', [])
-    if not pages:
-        print("沒有獲取到任何非重定向頁面。")
-        return
-    
-    for p in pages:
-        pageid = p['pageid']
-        title = p['title']
-        
-        # 4) 取得該頁原始碼
-        params_content = {
+    while True:
+        params_allpages = {
             'action': 'query',
-            'prop': 'revisions',
-            'rvprop': 'content',
-            'rvslots': 'main',
-            'pageids': pageid,
+            'list': 'allpages',
+            'apnamespace': '0',               # 條目名字空間
+            'apfilterredir': 'nonredirects',  # 排除重定向
+            'aplimit': ap_limit,
             'format': 'json'
         }
-        resp_content = S.get(API_URL, params=params_content, headers=HEADERS)
-        jdata = resp_content.json()
+        if apcontinue:
+            params_allpages['apcontinue'] = apcontinue
         
-        pages_dict = jdata.get('query', {}).get('pages', {})
-        page_obj = pages_dict.get(str(pageid), {})
-        revs = page_obj.get('revisions', [])
+        # 抓取一批頁面
+        r_allpages = S.get(API_URL, params=params_allpages, headers=HEADERS)
+        data_ap = r_allpages.json()
         
-        if not revs:
-            print(f"條目「{title}」沒有內容，跳過。")
-            continue
+        # 解析頁面列表
+        pages = data_ap.get('query', {}).get('allpages', [])
+        if not pages:
+            print("本批沒有取得任何條目，或遍歷結束。")
+            break
         
-        wikitext = revs[0]['slots']['main'].get('*', '')
-        lower_text = wikitext.lower()
-        
-        # (1) 跳過已掛Stub或Substub
-        if '{{stub' in lower_text or '{{substub' in lower_text:
-            print(f"條目「{title}」已掛 stub 或 substub，跳過。")
-            continue
-        
-        # (2) 檢查消歧義模板
-        if any(tpl.lower() in lower_text for tpl in DISAMBIG_TEMPLATES):
-            print(f"條目「{title}」含消歧義模板，跳過。")
-            continue
-        
-        # (3) 檢查是否測試/廣告 (簡易判斷)
-        if is_spam_or_test_page(wikitext):
-            print(f"條目「{title}」疑似測試或廣告頁，跳過。")
-            continue
-        
-        # 5) 計算字數
-        cleaned = remove_some_markup(wikitext)
-        length_score = count_effective_length(cleaned)
-        
-        # 6) 只判斷「小作品」(長度 < 200)
-        if length_score < 200:
-            # 掛 {{stub}}
-            new_text = wikitext.strip() + "\n\n{{stub}}"
-            summary_msg = "小作品"
+        for p in pages:
+            pageid = p['pageid']
+            title = p['title']
             
-            # 寫入
-            if new_text != wikitext:
-                ok = edit_page(S, csrf_token, title, new_text, summary_msg)
-                if ok:
-                    print(f"條目「{title}」掛上 {{stub}} 成功。（字數={length_score:.1f}）")
-                else:
-                    print(f"條目「{title}」掛 {{stub}} 失敗。")
+            # 取得該頁面原始碼
+            params_content = {
+                'action': 'query',
+                'prop': 'revisions',
+                'rvprop': 'content',
+                'rvslots': 'main',
+                'pageids': pageid,
+                'format': 'json'
+            }
+            resp_content = S.get(API_URL, params=params_content, headers=HEADERS)
+            jdata = resp_content.json()
+            
+            pages_dict = jdata.get('query', {}).get('pages', {})
+            page_obj = pages_dict.get(str(pageid), {})
+            revs = page_obj.get('revisions', [])
+            
+            if not revs:
+                print(f"條目「{title}」沒有內容，跳過。")
+                continue
+            
+            wikitext = revs[0]['slots']['main'].get('*', '')
+            lower_text = wikitext.lower()
+            
+            # 跳過已掛 stub/substub
+            if '{{stub' in lower_text or '{{substub' in lower_text:
+                print(f"條目「{title}」已掛 stub 或 substub，跳過。")
+                continue
+            
+            # 跳過含消歧義模板
+            if any(tpl.lower() in lower_text for tpl in DISAMBIG_TEMPLATES):
+                print(f"條目「{title}」含消歧義模板，跳過。")
+                continue
+            
+            # 跳過疑似測試/廣告頁
+            if is_spam_or_test_page(wikitext):
+                print(f"條目「{title}」疑似測試或廣告頁，跳過。")
+                continue
+            
+            # 計算字數
+            cleaned = remove_some_markup(wikitext)
+            length_score = count_effective_length(cleaned)
+            
+            # 若 < 200，掛{{stub}}
+            if length_score < 200:
+                new_text = wikitext.strip() + "\n\n{{stub}}"
+                summary_msg = f"Bot: 自動標示此條目為小作品 (字數={length_score:.1f})"
+                
+                if new_text != wikitext:
+                    ok = edit_page(S, csrf_token, title, new_text, summary_msg)
+                    if ok:
+                        print(f"條目「{title}」掛{{stub}}成功。（字數={length_score:.1f}）")
+                    else:
+                        print(f"條目「{title}」掛{{stub}}失敗。")
+            else:
+                print(f"條目「{title}」字數≥200 ({length_score:.1f})，不處理。")
+            
+            # (選擇性) 節流，以免頻繁編輯引發伺服器壓力
+            # time.sleep(1)
+        
+        # 檢查是否有下一批
+        if 'continue' in data_ap:
+            apcontinue = data_ap['continue']['apcontinue']
+            print(f"繼續下一批，apcontinue = {apcontinue}")
         else:
-            print(f"條目「{title}」字數 ≥ 200 ({length_score:.1f})，不掛模板。")
+            print("已無後續頁面，遍歷結束。")
+            break
     
-    print("程式已執行完畢，只執行一次。")
+    print("程式已執行完畢。")
 
 if __name__ == "__main__":
     main()
